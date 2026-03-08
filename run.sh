@@ -103,7 +103,7 @@ for attempt in $(seq 1 $MAX_RETRIES); do
     --warmstart_from "$CKPT" \
     --steps 1000000 \
     --block 576 \
-    --batch_size 2 \
+    --batch_size 1 \
     --save_dir /workspace/ckpts_tt \
     --save_every 500 \
     --tt_dtype bf16 \
