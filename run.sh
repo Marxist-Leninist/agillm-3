@@ -14,7 +14,6 @@ fi
 CKPT="/workspace/ckpts/pretrain_step09131773.pt"
 if [ ! -f "$CKPT" ]; then
   echo "[$(date -u)] Downloading checkpoint from HuggingFace..."
-  pip install -q huggingface_hub 2>/dev/null
   curl -L -o "$CKPT" https://huggingface.co/OpenTransformer/AGILLM-3/resolve/main/pretrain_step09131773.pt
   echo "[$(date -u)] Download complete: $(ls -lh $CKPT)"
 else
@@ -26,33 +25,32 @@ mkdir -p /workspace/ckpts_tt
 cat > /workspace/upload_ckpt.py << 'PYEOF'
 import os, glob
 from huggingface_hub import HfApi
-REPO = "OpenTransformer/AGILLM-3-Large-Tenstorrent"
+REPO = "OpenTransformer/AGILLM-3"
 def upload_latest():
     api = HfApi()
     pts = sorted(glob.glob("/workspace/ckpts_tt/*.pt"), key=os.path.getmtime)
     if not pts: print("No checkpoints"); return
     f = pts[-1]
     print(f"Uploading {os.path.basename(f)} ({os.path.getsize(f)/1e9:.2f}GB)...")
-    api.upload_file(path_or_fileobj=f, path_in_repo=os.path.basename(f), repo_id=REPO)
+    api.upload_file(path_or_fileobj=f, path_in_repo=f"tenstorrent/{os.path.basename(f)}", repo_id=REPO)
     print("Done.")
 if __name__ == "__main__": upload_latest()
 PYEOF
 
 echo "[$(date -u)] Starting training..."
 
-# Start training in background
+# Start training
 python3 /workspace/n_tenstorrent_port.py train \
   --backend tt \
   --preset base \
   --warmstart_from "$CKPT" \
   --steps 1000000 \
   --block 576 \
-  --batch_size 2 \
+  --batch_size 1 \
   --save_dir /workspace/ckpts_tt \
-  --save_every 500 \
+  --save_every_sec 1800 \
   --tt_dtype bf16 \
-  --tt_optimization_level 1 \
-  2>&1 | tee /workspace/train.log &
+  > /workspace/train.log 2>&1 &
 
 TRAIN_PID=$!
 echo "Training PID: $TRAIN_PID"
