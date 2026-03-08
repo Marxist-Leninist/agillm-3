@@ -3,61 +3,117 @@
 
 698M parameter language model using joint autoregressive + semi-autoregressive (AR+SAT) architecture with tuneable expansion ratio attention.
 
-### Files
-
-| File | Lines | Purpose |
-|------|-------|---------|
-| `n.py` | 1032 | Original CUDA trainer/inferencer (vast.ai) |
-| `n_tenstorrent.py` | 1574 | **TT-XLA port** — training-first, runs on Tenstorrent N300s via Koyeb |
-| `n_tt.py` | 1300 | Alternative TT port using torch_ttnn (inference-focused) |
-| `nat_mamba.py` | 625 | Mamba/SSM architecture variant |
-| `nat_mamba_final.py` | 477 | Final Mamba variant |
-| `nat_mamba_simple.py` | 285 | Simplified Mamba variant |
-
 ### Architecture
 - **Tuneable Attention MHA** with rank projection (U matrix) — configurable expansion ratio
 - **ALiBi** positional encoding (no learned positional embeddings)
 - **Joint AR+SAT** training — autoregressive + semi-autoregressive heads trained simultaneously
 - **Variable stride SAT** — gated stride prediction for speculative generation
 
-### Tenstorrent N300s Training (n_tenstorrent.py)
+---
 
-Training-first port using TT-XLA / pjrt-plugin-tt. Key design decisions:
-- Conservative `torch_xla` device loop (matches tt-blacksmith training recipes)
-- Model weights cast to **bfloat16** on TT, fp32 on CUDA
-- Masks use `-1e9` instead of `-inf` (bf16 compatibility)
-- Checkpoints saved as **portable CPU fp32** — cross-compatible TT <-> CUDA <-> CPU
-- TT inference uses full-recompute path (dynamic KV-cache not supported on XLA)
-- `--accelerator {auto,tt,cuda,cpu}` flag for runtime selection
+### Tenstorrent Port Scripts
 
+| Script | Backend API | Author | Status |
+|--------|------------|--------|--------|
+| **`n_tenstorrent_port.py`** | TT-XLA / PJRT | GPT-5.4 Pro Extended Thinking | **Recommended — use this one** |
+| `n_tenstorrent.py` | TT-XLA / PJRT | GPT-5.4 Pro Extended Thinking | Alternative port |
+| `n_tt_singlefile.py` | TT-XLA / PJRT | GPT-5.4 Pro Standard | Alternative port |
+| `n_tt.py` | torch_ttnn (deprecated) | Early exploration | Legacy / reference only |
+
+**Use `n_tenstorrent_port.py`** — it has the most complete training path, SPMD support, and robust checkpoint cross-compatibility between CUDA and TT.
+
+See [`n_tenstorrent_port_README.md`](n_tenstorrent_port_README.md) for detailed setup and usage.
+
+---
+
+### All Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `n.py` | 1032 | Original CUDA trainer/inferencer (vast.ai) |
+| `n_tenstorrent_port.py` | 1755 | **Primary TT-XLA port** — training + inference on N300s |
+| `n_tenstorrent.py` | 1574 | Alternative TT-XLA port |
+| `n_tt_singlefile.py` | 1637 | Alternative TT-XLA port (Pro Standard) |
+| `n_tt.py` | 1300 | Legacy TT port using torch_ttnn |
+| `nat_mamba.py` | 625 | Mamba/SSM architecture variant |
+| `nat_mamba_final.py` | 477 | Final Mamba variant |
+| `nat_mamba_simple.py` | 285 | Simplified Mamba variant |
+
+---
+
+### Key Features of n_tenstorrent_port.py
+- `--backend auto|cuda|tt|cpu` — auto-detects available hardware
+- Training via XLA-style optimizer stepping (`xm.optimizer_step`)
+- Checkpoints always saved as CPU tensors — **load NVIDIA-trained checkpoints on TT and vice versa**
+- Static-shape inference on TT (avoids XLA recompilation traps)
+- TT tuning flags: `--tt_dtype`, `--tt_bfp8`, `--tt_weight_bfp8`, `--tt_optimization_level`, `--tt_trace`
+- Experimental SPMD for 2-chip N300 (`--tt_spmd`)
+
+---
+
+### Quick Start — Koyeb Setup
 ```bash
-# Train on Tenstorrent
-python n_tenstorrent.py train --accelerator tt --preset base --block 576 --steps 1000
-
-# Resume CUDA checkpoint on TT
-python n_tenstorrent.py train --accelerator tt --resume ckpts/final.pt
-
-# Train on CUDA (vast.ai)
-python n.py train --preset base --amp --compile --source ...
-
-# Infer on TT
-python n_tenstorrent.py infer --accelerator tt --mode ar --ckpt ckpts/final.pt --prompt "Hello"
-```
-
-### Koyeb Setup (free 2-week N300s access)
-1. Sign up at [koyeb.com](https://koyeb.com)
-2. Join [Tenstorrent Discord](https://discord.gg/tenstorrent)
-3. Activate coupon: `TTDEPLOY25FADEV2W`
-4. Deploy with VSCode tunnel or Docker
-
-### Install (TT-XLA)
-```bash
+# 1. Activate coupon at koyeb.com: TTDEPLOY25FADEV2W (1x N300s, 2 weeks)
+# 2. Set up environment
+python3 -m venv .xla-venv
+source .xla-venv/bin/activate
 pip install pjrt-plugin-tt --extra-index-url https://pypi.eng.aws.tenstorrent.com/
-pip install transformers datasets
+pip install torch datasets transformers sentencepiece safetensors
 ```
+
+### Training on TT
+```bash
+python n_tenstorrent_port.py train \
+  --backend tt \
+  --preset nano_3x \
+  --steps 10000 \
+  --batch_size 4 \
+  --block 576 \
+  --save_dir /workspace/ckpts_tt \
+  --tt_dtype bf16 \
+  --tt_optimization_level 1
+```
+
+### Warm-Start from NVIDIA Checkpoint → Continue Training on TT
+```bash
+python n_tenstorrent_port.py train \
+  --backend tt \
+  --preset nano_3x \
+  --warmstart_from /workspace/ckpts_expansion/final.pt \
+  --steps 10000 \
+  --batch_size 4 \
+  --block 576 \
+  --save_dir /workspace/ckpts_tt_resume \
+  --tt_dtype bf16
+```
+
+### Inference on TT (using NVIDIA-trained checkpoint)
+```bash
+python n_tenstorrent_port.py infer \
+  --backend tt \
+  --mode ar \
+  --ckpt /workspace/ckpts_expansion/final.pt \
+  --prompt "The capital of France is" \
+  --max_new 64 \
+  --tt_dtype bf16
+```
+
+### Train on CUDA (vast.ai)
+```bash
+python n.py train --preset base --amp --compile --source ...
+```
+
+---
 
 ### Presets
 `femto` -> `pico` -> `nano` -> `micro` -> `small` -> `base` -> `large` with expansion ratios from 1x to 96x.
+
+### Koyeb Instance Is STATELESS
+Save everything externally before the 2-week window ends!
+```bash
+scp -r /workspace/ckpts/ your_server:~/tt_ckpts/
+scp -r /workspace/benchmarks/ your_server:~/tt_benchmarks/
+```
 
 ### License
 Apache-2.0
