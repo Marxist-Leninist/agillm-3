@@ -18,13 +18,14 @@ RUN pip install --no-cache-dir \
 # Copy training scripts
 COPY n_tenstorrent_port.py /workspace/n_tenstorrent_port.py
 COPY n.py /workspace/n.py
+COPY entrypoint.sh /workspace/entrypoint.sh
 
 # Create dirs
-RUN mkdir -p /workspace/ckpts /workspace/logs
+RUN mkdir -p /workspace/ckpts /workspace/ckpts_tt /workspace/logs
 
 # Env defaults for TT runtime
 ENV PJRT_DEVICE=TT
 ENV XLA_STABLEHLO_COMPILE=1
 
-# Default: shell (user runs training command)
-CMD ["sleep", "infinity"]
+# Run training on startup
+CMD ["bash", "/workspace/entrypoint.sh"]
