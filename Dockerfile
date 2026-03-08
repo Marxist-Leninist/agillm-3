@@ -27,4 +27,4 @@ ENV PJRT_DEVICE=TT
 ENV XLA_STABLEHLO_COMPILE=1
 
 # Default: shell (user runs training command)
-CMD ["/bin/bash"]
+CMD ["sleep", "infinity"]
