@@ -29,4 +29,4 @@ ENV PJRT_DEVICE=TT
 ENV XLA_STABLEHLO_COMPILE=1
 
 # Run training
-CMD ["/workspace/run.sh"]
+CMD ["sleep", "infinity"]
