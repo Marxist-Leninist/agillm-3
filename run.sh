@@ -1,4 +1,5 @@
 #!/bin/bash
+set -o pipefail
 echo "=== AGILLM-3 Training on Tenstorrent N300s ==="
 echo "Started: $(date -u)"
 
@@ -32,9 +33,13 @@ for dev in /dev/tenstorrent/*; do
 done
 
 # Reset TT device to clear any stale state from previous sessions
-echo "[$(date -u)] Resetting TT device with tt-smi..."
+# Do TWO resets with a gap - first clears stale state, second ensures clean start
+echo "[$(date -u)] Resetting TT device with tt-smi (pass 1)..."
 if command -v tt-smi &>/dev/null; then
-  timeout 30 tt-smi -r 0 2>&1 || echo "  tt-smi reset timed out or failed, continuing anyway"
+  timeout 30 tt-smi -r 0 2>&1 || echo "  tt-smi reset 1 failed, continuing"
+  sleep 10
+  echo "[$(date -u)] Resetting TT device with tt-smi (pass 2)..."
+  timeout 30 tt-smi -r 0 2>&1 || echo "  tt-smi reset 2 failed, continuing"
   sleep 5
   # Re-fix permissions after reset
   for dev in /dev/tenstorrent/*; do
@@ -42,9 +47,15 @@ if command -v tt-smi &>/dev/null; then
   done
 fi
 
-# Extra wait for firmware to stabilize
-echo "[$(date -u)] Waiting 15s for TT firmware to stabilize..."
-sleep 15
+# Longer wait for firmware + Ethernet links to fully stabilize
+echo "[$(date -u)] Waiting 45s for TT firmware and Ethernet links to stabilize..."
+sleep 45
+
+# Verify TT device is accessible
+echo "[$(date -u)] Probing TT device..."
+if command -v tt-smi &>/dev/null; then
+  timeout 30 tt-smi 2>&1 | head -30 || echo "  tt-smi probe failed"
+fi
 
 # Download checkpoint from HuggingFace if not present
 mkdir -p /workspace/ckpts
@@ -81,22 +92,26 @@ export XLA_STABLEHLO_COMPILE=1
 
 MAX_RETRIES=5
 for attempt in $(seq 1 $MAX_RETRIES); do
-  echo "[$(date -u)] Training attempt $attempt/$MAX_RETRIES"
+  echo "[$(date -u)] ========== Training attempt $attempt/$MAX_RETRIES =========="
 
-  # Re-fix device permissions and reset before each attempt
+  # Re-fix device permissions and reset before each retry
   for dev in /dev/tenstorrent/*; do
     chmod 666 "$dev" 2>/dev/null
   done
   if [ $attempt -gt 1 ] && command -v tt-smi &>/dev/null; then
     echo "[$(date -u)] Resetting TT device before retry..."
     timeout 30 tt-smi -r 0 2>&1 || true
-    sleep 10
+    sleep 15
+    timeout 30 tt-smi -r 0 2>&1 || true
+    sleep 30
     for dev in /dev/tenstorrent/*; do
       chmod 666 "$dev" 2>/dev/null
     done
+    echo "[$(date -u)] Post-reset stabilization complete"
   fi
 
-  # Start training in background
+  # Run training DIRECTLY (no pipe to tee - fixes PID tracking bug)
+  # Redirect stdout+stderr to log file, also copy to container stdout via tail
   python3 /workspace/n_tenstorrent_port.py train \
     --backend tt \
     --preset base \
@@ -108,10 +123,17 @@ for attempt in $(seq 1 $MAX_RETRIES); do
     --save_every 500 \
     --tt_dtype bf16 \
     --tt_optimization_level 1 \
-    2>&1 | tee /workspace/train.log &
+    > /workspace/train_attempt${attempt}.log 2>&1 &
 
   TRAIN_PID=$!
-  echo "[$(date -u)] Training PID: $TRAIN_PID"
+  echo "[$(date -u)] Training PID: $TRAIN_PID (actual python process)"
+
+  # Tail the log in background so we can see output
+  tail -f /workspace/train_attempt${attempt}.log 2>/dev/null &
+  TAIL_PID=$!
+
+  # Symlink latest log
+  ln -sf /workspace/train_attempt${attempt}.log /workspace/train.log
 
   # Upload to HF every 30 min while training runs
   while kill -0 $TRAIN_PID 2>/dev/null; do
@@ -122,22 +144,29 @@ for attempt in $(seq 1 $MAX_RETRIES); do
     fi
   done
 
-  # Check if training exited cleanly
+  # Kill the tail process
+  kill $TAIL_PID 2>/dev/null
+
+  # Get REAL exit code from python (not tee)
   wait $TRAIN_PID
   EXIT_CODE=$?
+  echo "[$(date -u)] Training exited with code: $EXIT_CODE"
+
   if [ $EXIT_CODE -eq 0 ]; then
     echo "[$(date -u)] Training completed successfully!"
     break
   fi
 
-  echo "[$(date -u)] Training crashed (exit $EXIT_CODE). Retry in 60s..."
+  echo "[$(date -u)] Training crashed (exit $EXIT_CODE). Log tail:"
+  tail -20 /workspace/train_attempt${attempt}.log
+  echo "[$(date -u)] Will retry in 60s..."
   sleep 60
 done
 
 # Final upload
 echo "[$(date -u)] Final checkpoint upload..."
 python3 /workspace/upload_ckpt.py 2>&1 || true
-echo "[$(date -u)] All done."
+echo "[$(date -u)] All done. Attempts used: $attempt/$MAX_RETRIES"
 
 # Keep container alive so we can exec in
 while true; do sleep 3600; done
