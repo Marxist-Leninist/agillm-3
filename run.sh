@@ -9,15 +9,35 @@ if [ -n "$HF_TOKEN" ]; then
   echo "HF token configured"
 fi
 
-# Fix Tenstorrent device permissions (they start as 000)
-echo "[$(date -u)] Fixing TT device permissions..."
-for dev in /dev/tenstorrent/*; do
-  chmod 666 "$dev" 2>/dev/null && echo "Fixed: $dev $(ls -la $dev)"
+# Wait for TT device to appear (can take 30-60s after container start)
+echo "[$(date -u)] Waiting for TT device to appear..."
+for i in $(seq 1 120); do
+  if ls /dev/tenstorrent/* 1>/dev/null 2>&1; then
+    echo "[$(date -u)] TT device found after ${i}s"
+    break
+  fi
+  if [ $i -eq 120 ]; then
+    echo "[$(date -u)] ERROR: No TT device after 120s. Listing /dev:"
+    ls -la /dev/ | grep -i ten
+    echo "Keeping container alive for debugging..."
+    while true; do sleep 3600; done
+  fi
+  sleep 1
 done
 
-# Wait for firmware to fully initialize
-echo "[$(date -u)] Waiting 10s for TT firmware init..."
-sleep 10
+# Fix device permissions
+echo "[$(date -u)] Fixing TT device permissions..."
+for dev in /dev/tenstorrent/*; do
+  chmod 666 "$dev" 2>/dev/null && echo "  Fixed: $dev -> $(ls -la $dev)"
+done
+
+# Extra wait for firmware to fully initialize after device appears
+echo "[$(date -u)] Waiting 15s for TT firmware to stabilize..."
+sleep 15
+echo "[$(date -u)] Re-fixing permissions after firmware init..."
+for dev in /dev/tenstorrent/*; do
+  chmod 666 "$dev" 2>/dev/null && echo "  Fixed: $dev -> $(ls -la $dev)"
+done
 
 # Download checkpoint from HuggingFace if not present
 mkdir -p /workspace/ckpts
@@ -95,8 +115,12 @@ for attempt in $(seq 1 $MAX_RETRIES); do
     break
   fi
 
-  echo "[$(date -u)] Training crashed (exit $EXIT_CODE). Retry in 30s..."
-  sleep 30
+  echo "[$(date -u)] Training crashed (exit $EXIT_CODE). Retry in 60s..."
+  # Re-fix permissions and wait longer between retries
+  for dev in /dev/tenstorrent/*; do
+    chmod 666 "$dev" 2>/dev/null
+  done
+  sleep 60
 done
 
 # Final upload
