@@ -31,13 +31,20 @@ for dev in /dev/tenstorrent/*; do
   chmod 666 "$dev" 2>/dev/null && echo "  Fixed: $dev -> $(ls -la $dev)"
 done
 
-# Extra wait for firmware to fully initialize after device appears
+# Reset TT device to clear any stale state from previous sessions
+echo "[$(date -u)] Resetting TT device with tt-smi..."
+if command -v tt-smi &>/dev/null; then
+  timeout 30 tt-smi -r 0 2>&1 || echo "  tt-smi reset timed out or failed, continuing anyway"
+  sleep 5
+  # Re-fix permissions after reset
+  for dev in /dev/tenstorrent/*; do
+    chmod 666 "$dev" 2>/dev/null
+  done
+fi
+
+# Extra wait for firmware to stabilize
 echo "[$(date -u)] Waiting 15s for TT firmware to stabilize..."
 sleep 15
-echo "[$(date -u)] Re-fixing permissions after firmware init..."
-for dev in /dev/tenstorrent/*; do
-  chmod 666 "$dev" 2>/dev/null && echo "  Fixed: $dev -> $(ls -la $dev)"
-done
 
 # Download checkpoint from HuggingFace if not present
 mkdir -p /workspace/ckpts
@@ -76,10 +83,18 @@ MAX_RETRIES=5
 for attempt in $(seq 1 $MAX_RETRIES); do
   echo "[$(date -u)] Training attempt $attempt/$MAX_RETRIES"
 
-  # Re-fix device permissions before each attempt
+  # Re-fix device permissions and reset before each attempt
   for dev in /dev/tenstorrent/*; do
     chmod 666 "$dev" 2>/dev/null
   done
+  if [ $attempt -gt 1 ] && command -v tt-smi &>/dev/null; then
+    echo "[$(date -u)] Resetting TT device before retry..."
+    timeout 30 tt-smi -r 0 2>&1 || true
+    sleep 10
+    for dev in /dev/tenstorrent/*; do
+      chmod 666 "$dev" 2>/dev/null
+    done
+  fi
 
   # Start training in background
   python3 /workspace/n_tenstorrent_port.py train \
@@ -116,10 +131,6 @@ for attempt in $(seq 1 $MAX_RETRIES); do
   fi
 
   echo "[$(date -u)] Training crashed (exit $EXIT_CODE). Retry in 60s..."
-  # Re-fix permissions and wait longer between retries
-  for dev in /dev/tenstorrent/*; do
-    chmod 666 "$dev" 2>/dev/null
-  done
   sleep 60
 done
 

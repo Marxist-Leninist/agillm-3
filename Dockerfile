@@ -1,7 +1,7 @@
 FROM ghcr.io/tenstorrent/tt-xla-slim:latest
 
-# AGILLM-3 on Tenstorrent N300s — Koyeb Deployment
-# OpenTransformers Ltd — TT-XLA training-first port
+# AGILLM-3 on Tenstorrent N300s - Koyeb Deployment
+# OpenTransformers Ltd - TT-XLA training-first port
 
 WORKDIR /workspace
 
@@ -28,5 +28,5 @@ RUN mkdir -p /workspace/ckpts /workspace/logs
 ENV PJRT_DEVICE=TT
 ENV XLA_STABLEHLO_COMPILE=1
 
-# Run training
-CMD ["sleep", "infinity"]
+# Run training entrypoint
+CMD ["/workspace/run.sh"]
