@@ -120,9 +120,8 @@ for attempt in $(seq 1 $MAX_RETRIES); do
     --block 576 \
     --batch_size 1 \
     --save_dir /workspace/ckpts_tt \
-    --save_every 500 \
+    --save_every_sec 1800 \
     --tt_dtype bf16 \
-    --tt_optimization_level 1 \
     > /workspace/train_attempt${attempt}.log 2>&1 &
 
   TRAIN_PID=$!

@@ -30,8 +30,24 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import DownloadConfig, load_dataset
-from transformers import AutoTokenizer, logging as hf_log
+
+try:
+    from datasets import DownloadConfig, load_dataset
+except Exception:
+    DownloadConfig = None
+    load_dataset = None
+
+try:
+    from transformers import AutoTokenizer, logging as hf_log
+except Exception:
+    AutoTokenizer = None
+
+    class _HFLogFallback:
+        @staticmethod
+        def set_verbosity_error():
+            return None
+
+    hf_log = _HFLogFallback()
 
 STATUS_FILE = "/workspace/status.json"
 
@@ -51,6 +67,7 @@ def write_status(step, seen_tok, loss, batch, block, tok_per_sec, phase):
                     "phase": phase,
                     "updated": time.time(),
                     "target_tok": 35737600000,
+                    "backend": RUNTIME.backend,
                 },
                 f,
             )
@@ -71,7 +88,7 @@ def show_status():
             f"Step: {s.get('step', '?'):,} | Tokens: {s.get('seen_tok', 0)/1e9:.2f}B / {target/1e9:.1f}B | Loss: {s.get('loss', 0):.4f}"
         )
         print(
-            f"Speed: {s.get('tok_per_sec', 0):.0f} tok/s | B={s.get('batch')} L={s.get('block')} | ETA: {eta_days:.1f} days | {age:.0f}s ago"
+            f"Speed: {s.get('tok_per_sec', 0):.0f} tok/s | B={s.get('batch')} L={s.get('block')} | ETA: {eta_days:.1f} days | {age:.0f}s ago | backend={s.get('backend', '?')}"
         )
     except FileNotFoundError:
         print("No status file. Training not running?")
@@ -241,17 +258,25 @@ def setup_runtime(args) -> BackendRuntime:
         import torch_xla.core.xla_model as xm
         import torch_xla.runtime as xr
 
-        # xr.set_device_type("TT")  # DISABLED: TT plugin auto-configures
-        compile_options = {
-            "optimization_level": str(getattr(args, "tt_optimization_level", 1)),
-        }
+        xr.set_device_type("TT")
+        compile_options = {}
+        if getattr(args, "tt_optimization_level", None) is not None:
+            compile_options["optimization_level"] = str(getattr(args, "tt_optimization_level"))
         if getattr(args, "tt_bfp8", False):
             compile_options["enable_bfp8_conversion"] = "true"
         if getattr(args, "tt_weight_bfp8", False):
             compile_options["experimental_enable_weight_bfp8_conversion"] = "true"
         if getattr(args, "tt_trace", False):
             compile_options["enable_trace"] = "true"
-        # torch_xla.set_custom_compile_options(compile_options)  # DISABLED: triggers ARC core crash
+
+        if compile_options:
+            try:
+                torch_xla.set_custom_compile_options(compile_options)
+            except Exception as e:
+                print(f"[tt-xla] warning: set_custom_compile_options failed, continuing with TT-XLA defaults: {e}")
+                compile_options = None
+        else:
+            compile_options = None
 
         xs = None
         mesh = None
@@ -274,9 +299,21 @@ def setup_runtime(args) -> BackendRuntime:
                 mesh = None
                 num_devices = 1
 
+        try:
+            tt_device = xm.xla_device()
+        except Exception as e:
+            msg = str(e)
+            if "NoAccess" in msg or "failed to start" in msg or "ARC core" in msg:
+                raise RuntimeError(
+                    "TT device initialization failed. On Koyeb this is usually a /dev/tenstorrent access problem "
+                    "inside the container. Fix device permissions in the container startup (for example: chmod 666 /dev/tenstorrent/*), "
+                    "then retry."
+                ) from e
+            raise
+
         runtime = BackendRuntime(
             backend="tt",
-            device=xm.xla_device(),
+            device=tt_device,
             is_tt=True,
             is_xla=True,
             dtype=torch.bfloat16 if getattr(args, "tt_dtype", "bf16") == "bf16" else torch.float32,
@@ -300,12 +337,27 @@ def setup_runtime(args) -> BackendRuntime:
 
 # ───────────────────────── Tokenizer / vocab ─────────────────────────
 TOKENIZER_ID = os.environ.get("TOKENIZER_ID", "deepseek-ai/DeepSeek-V3.2")
-tok = AutoTokenizer.from_pretrained(TOKENIZER_ID, use_fast=True, trust_remote_code=True)
-if tok.pad_token is None:
-    tok.add_special_tokens({"pad_token": "<|pad|>"})
-VOCAB = max(tok.get_vocab().values()) + 1
-EOS = tok.eos_token_id if tok.eos_token_id is not None else tok.sep_token_id
-PAD_ID = tok.pad_token_id if tok.pad_token_id is not None else (EOS if EOS is not None else 0)
+tok = None
+VOCAB = None
+EOS = None
+PAD_ID = None
+
+
+def ensure_tokenizer() -> None:
+    global tok, VOCAB, EOS, PAD_ID
+    if tok is not None:
+        return
+    if AutoTokenizer is None:
+        raise RuntimeError(
+            "transformers is not installed. Install it with: pip install transformers sentencepiece safetensors"
+        )
+    tok_local = AutoTokenizer.from_pretrained(TOKENIZER_ID, use_fast=True, trust_remote_code=True)
+    if tok_local.pad_token is None:
+        tok_local.add_special_tokens({"pad_token": "<|pad|>"})
+    tok = tok_local
+    VOCAB = max(tok.get_vocab().values()) + 1
+    EOS = tok.eos_token_id if tok.eos_token_id is not None else tok.sep_token_id
+    PAD_ID = tok.pad_token_id if tok.pad_token_id is not None else (EOS if EOS is not None else 0)
 
 
 # ───────────────────────── Presets / defaults ─────────────────────────
@@ -558,6 +610,7 @@ def _coerce_role(r: str) -> str:
 
 
 def _render_chat_text_from_ex(ex: dict, messages_key: str, add_generation_prompt: bool) -> Optional[str]:
+    ensure_tokenizer()
     msgs = ex.get(messages_key)
     if msgs is None:
         for alt in ("conversations", "dialog", "turns"):
@@ -641,6 +694,9 @@ def token_stream(
     dataset_field_text: str = "text",
     streaming: bool = True,
 ):
+    ensure_tokenizer()
+    if DownloadConfig is None or load_dataset is None:
+        raise RuntimeError("datasets is not installed. Install it with: pip install datasets")
     ds_names = get_hot_datasets(ds_names)
     sources = [s.strip() for s in ds_names.split(",") if s.strip()]
     if not sources:
@@ -692,6 +748,12 @@ def token_stream(
 # ───────────────────────── ALiBi ─────────────────────────
 @torch._dynamo.disable
 def _alibi_slopes(n_heads: int):
+    """Compute ALiBi slopes on CPU to avoid TT tile-alignment reshape issues.
+
+    TT Wormhole tiles the last 2 dims to 32x32. Creating tensors like
+    (1, h, 1, 1) with h=16 < 32 causes volume mismatch in TTNN reshape.
+    Computing on CPU avoids this entirely.
+    """
     def pow2slopes(n):
         start = 2 ** (-2 ** -(math.log2(n) - 3))
         ratio = start
@@ -704,18 +766,55 @@ def _alibi_slopes(n_heads: int):
         vals = pow2slopes(closest)
         extra = pow2slopes(2 * closest)
         vals += extra[0::2][: n_heads - closest]
-    return torch.tensor(vals, device=DEV).view(1, n_heads, 1, 1)
+    # Return CPU tensor — caller transfers final result to device
+    return torch.tensor(vals, dtype=torch.float32).view(1, n_heads, 1, 1)
 
 
 @torch._dynamo.disable
 def alibi_bias(n_heads: int, n_tokens: int):
-    i = torch.arange(n_tokens, device=DEV).view(1, 1, n_tokens, 1)
-    j = torch.arange(n_tokens, device=DEV).view(1, 1, 1, n_tokens)
+    """Compute ALiBi bias on CPU then transfer to device.
+
+    All intermediate shapes involve (1, 1, N, 1) or (1, h, 1, 1) which have
+    dimensions < 32 in the last 2 positions — these cause TT_FATAL reshape
+    volume mismatches due to 32x32 tile padding. Computing on CPU is safe
+    and the final result (1, h, N, N) has last-2-dims >= 32 when N >= 32.
+    """
+    i = torch.arange(n_tokens, dtype=torch.float32).view(1, 1, n_tokens, 1)
+    j = torch.arange(n_tokens, dtype=torch.float32).view(1, 1, 1, n_tokens)
     dist = (j - i).clamp_min(0)
-    return -_alibi_slopes(n_heads) * dist
+    bias = -_alibi_slopes(n_heads) * dist  # (1, h, N, N) computed on CPU
+    return bias.to(DEV)  # transfer final result — last 2 dims are (N, N), tile-safe
 
 
 # ───────────────────────── Model components ─────────────────────────
+def _tt_split_heads(x: torch.Tensor, h: int) -> torch.Tensor:
+    """Split (B, N, d) -> (B, h, N, dk) without creating h < 32 in last 2 dims.
+
+    TT Wormhole tiles the last 2 tensor dimensions to 32x32.  The standard
+    approach ``x.view(B, N, h, dk).transpose(1, 2)`` creates an intermediate
+    tensor (B, N, h, dk) where h (e.g. 16) sits in the penultimate position
+    and gets tile-padded to 32, causing a volume mismatch crash in TTNN reshape.
+
+    Instead we use ``chunk`` (produces slices along the aligned last dim) then
+    ``stack`` (inserts h at dim-1, keeping last 2 dims as N and dk, both >= 32).
+    """
+    dk = x.size(-1) // h
+    chunks = x.chunk(h, dim=-1)          # h tensors of (B, N, dk) — tile-safe
+    return torch.stack(chunks, dim=1)     # (B, h, N, dk)  — last 2 dims N, dk ✓
+
+
+def _tt_merge_heads(z: torch.Tensor) -> torch.Tensor:
+    """Merge (B, h, N, dk) -> (B, N, d) without creating h < 32 in last 2 dims.
+
+    The standard ``.transpose(1,2).reshape(B, N, -1)`` creates intermediate
+    (B, N, h, dk) with h in the penultimate position — crashes on TT.
+
+    Instead we ``unbind`` along the head dim (each slice is (B, N, dk) — safe)
+    then ``cat`` along the last dim to get (B, N, h*dk).
+    """
+    return torch.cat(z.unbind(dim=1), dim=-1)  # (B, N, h*dk)
+
+
 class TuneableAttentionMHA(nn.Module):
     def __init__(self, d: int, h: int, r: int, use_relpos: bool = True):
         super().__init__()
@@ -730,13 +829,24 @@ class TuneableAttentionMHA(nn.Module):
         self.proj = nn.Linear(h * self.dk, d, bias=False)
         self.drop = nn.Dropout(0.1)
 
-    def _proj_qk(self, x):
-        B, N, _ = x.shape
-        return (x.view(B, N, self.h, self.dk).transpose(1, 2) @ self.U)
-
-    def _reshape_v(self, x):
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """Split (B, N, d) -> (B, h, N, dk). TT-safe when RUNTIME.is_tt."""
+        if RUNTIME.is_tt:
+            return _tt_split_heads(x, self.h)
         B, N, _ = x.shape
         return x.view(B, N, self.h, self.dk).transpose(1, 2)
+
+    def _proj_qk(self, x):
+        return self._split_heads(x) @ self.U  # (B, h, N, dk) @ (dk, r) -> (B, h, N, r)
+
+    def _reshape_v(self, x):
+        return self._split_heads(x)  # (B, h, N, dk)
+
+    def _merge_heads(self, z: torch.Tensor) -> torch.Tensor:
+        """Merge (B, h, N, dk) -> (B, N, d). TT-safe when RUNTIME.is_tt."""
+        if RUNTIME.is_tt:
+            return _tt_merge_heads(z)
+        return z.transpose(1, 2).reshape(z.size(0), z.size(2), -1)
 
     def forward(self, x, mask=None, rel_bias_tokens=None, kv_cache=None, use_cache=False):
         q = self._proj_qk(self.q(x))
@@ -756,7 +866,7 @@ class TuneableAttentionMHA(nn.Module):
             att = att + alibi_bias(self.h, rel_bias_tokens).to(att.dtype)[:, :, -q.size(2) :, :]
         if mask is not None:
             att = att + mask.to(att.dtype)
-        z = (att.softmax(-1) @ v).transpose(1, 2).reshape(x.size(0), x.size(1), -1)
+        z = self._merge_heads(att.softmax(-1) @ v)  # (B, h, N, dk) -> (B, N, d)
         out = self.drop(self.proj(z))
         return (out, (k, v)) if use_cache else out
 
@@ -826,15 +936,20 @@ class SATHead(nn.Module):
 
 
 # ───────────────────────── Masks ─────────────────────────
+def neg_inf():
+    # TT BF16 is more stable with a large finite negative than literal -inf.
+    return -1e9 if RUNTIME.is_tt else float("-inf")
+
+
 def causal_mask(n):
-    return torch.triu(torch.full((1, 1, n, n), float("-inf"), device=DEV), 1)
+    return torch.triu(torch.full((1, 1, n, n), neg_inf(), device=DEV), 1)
 
 
 def sat_mask(n, block=SAT_BLOCK):
     idx = torch.arange(n, device=DEV)
     grp = idx.unsqueeze(0) // block
     allow = (grp.T == grp) | (grp.T > grp)
-    return torch.where(allow, 0.0, float("-inf")).unsqueeze(0).unsqueeze(0)
+    return torch.where(allow, 0.0, neg_inf()).unsqueeze(0).unsqueeze(0)
 
 
 def sat_mask_cached(new_len: int, cached_len: int, block=SAT_BLOCK):
@@ -845,16 +960,16 @@ def sat_mask_cached(new_len: int, cached_len: int, block=SAT_BLOCK):
 def causal_padded_mask(total_len: int, valid_len: int):
     mask = causal_mask(total_len)
     if valid_len < total_len:
-        mask[:, :, :, valid_len:] = float("-inf")
-        mask[:, :, valid_len:, :] = float("-inf")
+        mask[:, :, :, valid_len:] = neg_inf()
+        mask[:, :, valid_len:, :] = neg_inf()
     return mask
 
 
 def sat_padded_mask(total_len: int, valid_len: int):
     mask = sat_mask(total_len)
     if valid_len < total_len:
-        mask[:, :, :, valid_len:] = float("-inf")
-        mask[:, :, valid_len:, :] = float("-inf")
+        mask[:, :, :, valid_len:] = neg_inf()
+        mask[:, :, valid_len:, :] = neg_inf()
     return mask
 
 
@@ -924,6 +1039,7 @@ def _safe_load_any(path: pathlib.Path, tgt: nn.Module, key: str | None = None) -
     sd = ck.get(key, ck) if key else ck
     if isinstance(sd, dict) and "state_dict" in sd:
         sd = sd["state_dict"]
+    sd = _strip_compiled_prefix(sd)
     tgt_sd = tgt.state_dict()
     filt = {k: v for k, v in sd.items() if k in tgt_sd and v.shape == tgt_sd[k].shape}
     if filt:
@@ -946,6 +1062,8 @@ def infer_cfg_from_ckpt(path: pathlib.Path):
 
 # ───────────────────────── Training logic ─────────────────────────
 def _loss_float(x: torch.Tensor) -> float:
+    if RUNTIME.is_tt:
+        RUNTIME.sync(wait=True)
     try:
         return float(x.detach().float().cpu().item())
     except Exception:
@@ -983,6 +1101,8 @@ def _run_optimizer_step(args, opt, scaler, loss, trainable_params: Iterable[torc
     loss.backward()
     if trainable_params:
         nn.utils.clip_grad_norm_(trainable_params, 1.0)
+    if RUNTIME.is_tt:
+        RUNTIME.sync(wait=True)
     RUNTIME.optimizer_step(opt)
     if RUNTIME.is_tt:
         RUNTIME.sync(wait=True)
@@ -1068,7 +1188,7 @@ def _train_phase(
     print(f"[{phase_name}] BACKEND={RUNTIME.backend} AR_ONLY={args.ar_only} TIE_WEIGHTS={tie_weights} STREAMING={streaming}")
     if RUNTIME.is_tt:
         print(
-            f"[{phase_name}] TT dtype={str(RUNTIME.dtype).replace('torch.', '')} opt_level={args.tt_optimization_level} spmd={RUNTIME.spmd} devices={RUNTIME.num_devices}"
+            f"[{phase_name}] TT dtype={str(RUNTIME.dtype).replace('torch.', '')} opt_level={args.tt_optimization_level if args.tt_optimization_level is not None else 'default'} spmd={RUNTIME.spmd} devices={RUNTIME.num_devices}"
         )
 
     step_start_time = time.monotonic()
@@ -1204,6 +1324,7 @@ def _train_phase(
 
 # ───────────────────────── Main orchestrator ─────────────────────────
 def _build_models(cfg, tie_weights: bool):
+    ensure_tokenizer()
     core = Encoder(cfg, tie_weights=tie_weights)
     ar_h = ARHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None)
     sat_h = SATHead(cfg["d"], mode="var")
@@ -1212,12 +1333,12 @@ def _build_models(cfg, tie_weights: bool):
 
 
 
-def _maybe_cast_models_for_runtime(core, ar_h, sat_h):
+def _maybe_cast_models_for_runtime(core, ar_h, sat_h, tie_weights: bool):
     if RUNTIME.is_tt and RUNTIME.dtype == torch.bfloat16:
         core = core.to(dtype=torch.bfloat16)
         ar_h = ar_h.to(dtype=torch.bfloat16)
         sat_h = sat_h.to(dtype=torch.bfloat16)
-        retie_weights(core, ar_h, True if getattr(core, "tie_weights", False) or getattr(ar_h, "tie_weights", False) else False)
+        retie_weights(core, ar_h, tie_weights)
     return core, ar_h, sat_h
 
 
@@ -1249,7 +1370,9 @@ def _maybe_compile_models(args, core, ar_h, sat_h, tie_weights: bool):
 
 
 def train(args):
+    ensure_tokenizer()
     setup_runtime(args)
+    print(f"[runtime] backend={RUNTIME.backend} device={DEV} tt_spmd={RUNTIME.spmd} num_devices={RUNTIME.num_devices}")
     cfg = PRESETS[args.preset].copy()
     tie_weights = args.tie_weights
     print_expansion_info(cfg, tie_weights)
@@ -1287,7 +1410,7 @@ def train(args):
             if loaded:
                 print(f"Warm-start loaded from {src}")
 
-    core, ar_h, sat_h = _maybe_cast_models_for_runtime(core, ar_h, sat_h)
+    core, ar_h, sat_h = _maybe_cast_models_for_runtime(core, ar_h, sat_h, tie_weights)
     core, ar_h, sat_h = _move_models_to_device(core, ar_h, sat_h, tie_weights)
 
     _phase_freeze(core, freeze_core=args.freeze_core, unfreeze_ln=args.unfreeze_ln, train_emb=args.train_emb)
@@ -1502,6 +1625,7 @@ def _infer_tt_static(args, core, ar_h, sat_h, ids):
 
 @torch.no_grad()
 def infer(args):
+    ensure_tokenizer()
     setup_runtime(args)
     if args.mode == "ar":
         if args.temperature is None:
@@ -1708,7 +1832,7 @@ def main():
     tr.add_argument("--tt_dtype", choices=["fp32", "bf16"], default="bf16")
     tr.add_argument("--tt_bfp8", action="store_true")
     tr.add_argument("--tt_weight_bfp8", action="store_true")
-    tr.add_argument("--tt_optimization_level", type=int, default=1)
+    tr.add_argument("--tt_optimization_level", type=int, default=None, help="Optional TT compile optimization level. Leave unset for safest bring-up; try 0 or 1 once stable.")
     tr.add_argument("--tt_trace", action="store_true")
     tr.add_argument("--tt_trace_region_size", type=int, default=10_000_000)
     tr.add_argument("--tt_spmd", action="store_true", help="Experimental: shard batch across visible TT chips.")
@@ -1734,7 +1858,7 @@ def main():
     inf.add_argument("--tt_dtype", choices=["fp32", "bf16"], default="bf16")
     inf.add_argument("--tt_bfp8", action="store_true")
     inf.add_argument("--tt_weight_bfp8", action="store_true")
-    inf.add_argument("--tt_optimization_level", type=int, default=1)
+    inf.add_argument("--tt_optimization_level", type=int, default=None, help="Optional TT compile optimization level. Leave unset for safest bring-up; try 0 or 1 once stable.")
     inf.add_argument("--tt_trace", action="store_true")
     inf.add_argument("--tt_trace_region_size", type=int, default=10_000_000)
     inf.add_argument("--tt_spmd", action="store_true")
