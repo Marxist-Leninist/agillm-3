@@ -1,25 +1,30 @@
-FROM ghcr.io/tenstorrent/tt-metal/tt-metalium/ubuntu-22.04-amd64:latest
+FROM ghcr.io/tenstorrent/tt-xla-slim:latest
 
 # AGILLM-3 on Tenstorrent N300s — Koyeb Deployment
-# OpenTransformers Ltd
+# OpenTransformers Ltd — TT-XLA training-first port
 
 WORKDIR /workspace
 
-# Python deps
+# TT-XLA runtime deps
 RUN pip install --no-cache-dir \
     torch \
     transformers \
     datasets \
     huggingface_hub \
-    && pip install git+https://github.com/tenstorrent/pytorch2.0_ttnn.git || true
+    sentencepiece \
+    safetensors \
+    && pip install pjrt-plugin-tt --extra-index-url https://pypi.eng.aws.tenstorrent.com/ || true
 
-# Copy scripts
-COPY n_tt.py /workspace/n_tt.py
-COPY setup_koyeb.sh /workspace/setup_koyeb.sh
-RUN chmod +x /workspace/setup_koyeb.sh
+# Copy training scripts
+COPY n_tenstorrent_port.py /workspace/n_tenstorrent_port.py
+COPY n.py /workspace/n.py
 
 # Create dirs
-RUN mkdir -p /workspace/ckpts /workspace/benchmarks /workspace/logs
+RUN mkdir -p /workspace/ckpts /workspace/logs
 
-# Default: run setup then drop to shell
+# Env defaults for TT runtime
+ENV PJRT_DEVICE=TT
+ENV XLA_STABLEHLO_COMPILE=1
+
+# Default: shell (user runs training command)
 CMD ["/bin/bash"]
