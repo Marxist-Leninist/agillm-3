@@ -1,67 +1,63 @@
-# AGILLM-3 × Tenstorrent N300s
-## OpenTransformers Ltd — Inference Benchmark Package
+# AGILLM-3 — Joint AR+SAT Transformer
+## OpenTransformers Ltd
 
-### What This Is
-Modified AGILLM-3 trainer/inferencer with a device abstraction layer that supports:
-- **CUDA** (primary, for vast.ai training)
-- **Tenstorrent Wormhole N300s** (experimental, via Koyeb)
-- **CPU** (fallback)
+698M parameter language model using joint autoregressive + semi-autoregressive (AR+SAT) architecture with tuneable expansion ratio attention.
 
-### Reality Check
-From Tenstorrent's own model support table:
-- GPT-2 inference: 🚧 (partial, some ops fall back to CPU)
-- Llama/Falcon/OPT/GPTNeo: ❌ (don't compile at all)
-- Training throughput: ~10-100x slower than inference on TT
-- pytorch2.0_ttnn is deprecated → TT-Forge is the future
+### Files
 
-**Bottom line**: This is for R&D benchmarking, not replacing vast.ai training.
+| File | Lines | Purpose |
+|------|-------|---------|
+| `n.py` | 1032 | Original CUDA trainer/inferencer (vast.ai) |
+| `n_tenstorrent.py` | 1574 | **TT-XLA port** — training-first, runs on Tenstorrent N300s via Koyeb |
+| `n_tt.py` | 1300 | Alternative TT port using torch_ttnn (inference-focused) |
+| `nat_mamba.py` | 625 | Mamba/SSM architecture variant |
+| `nat_mamba_final.py` | 477 | Final Mamba variant |
+| `nat_mamba_simple.py` | 285 | Simplified Mamba variant |
 
-### Koyeb Setup (2-week free access)
+### Architecture
+- **Tuneable Attention MHA** with rank projection (U matrix) — configurable expansion ratio
+- **ALiBi** positional encoding (no learned positional embeddings)
+- **Joint AR+SAT** training — autoregressive + semi-autoregressive heads trained simultaneously
+- **Variable stride SAT** — gated stride prediction for speculative generation
+
+### Tenstorrent N300s Training (n_tenstorrent.py)
+
+Training-first port using TT-XLA / pjrt-plugin-tt. Key design decisions:
+- Conservative `torch_xla` device loop (matches tt-blacksmith training recipes)
+- Model weights cast to **bfloat16** on TT, fp32 on CUDA
+- Masks use `-1e9` instead of `-inf` (bf16 compatibility)
+- Checkpoints saved as **portable CPU fp32** — cross-compatible TT <-> CUDA <-> CPU
+- TT inference uses full-recompute path (dynamic KV-cache not supported on XLA)
+- `--accelerator {auto,tt,cuda,cpu}` flag for runtime selection
+
 ```bash
-# 1. Activate coupon at koyeb.com: TTDEPLOY25FADEV2W
-# 2. Deploy container or use VSCode tunnel
-# 3. Run setup
-bash setup_koyeb.sh
-# 4. Copy a small checkpoint for testing
-scp vast_instance:/workspace/ckpts/pretrain_step*.pt /workspace/ckpts/
+# Train on Tenstorrent
+python n_tenstorrent.py train --accelerator tt --preset base --block 576 --steps 1000
+
+# Resume CUDA checkpoint on TT
+python n_tenstorrent.py train --accelerator tt --resume ckpts/final.pt
+
+# Train on CUDA (vast.ai)
+python n.py train --preset base --amp --compile --source ...
+
+# Infer on TT
+python n_tenstorrent.py infer --accelerator tt --mode ar --ckpt ckpts/final.pt --prompt "Hello"
 ```
 
-### Usage
+### Koyeb Setup (free 2-week N300s access)
+1. Sign up at [koyeb.com](https://koyeb.com)
+2. Join [Tenstorrent Discord](https://discord.gg/tenstorrent)
+3. Activate coupon: `TTDEPLOY25FADEV2W`
+4. Deploy with VSCode tunnel or Docker
+
+### Install (TT-XLA)
 ```bash
-# Inference (auto-detects TT > CUDA > CPU)
-python3 n_tt.py infer --mode ar --ckpt ckpts/model.pt --prompt "Hello world"
-
-# Force TT backend
-python3 n_tt.py --backend tt infer --mode ar --ckpt ckpts/model.pt --prompt "Hello"
-
-# Test which ops compile to TT-NN
-python3 n_tt.py compile-test --ckpt ckpts/model.pt
-
-# Benchmark (N runs, reports tok/s stats)
-python3 n_tt.py benchmark --ckpt ckpts/model.pt --runs 10
-
-# Training (CUDA recommended, TT experimental)
-python3 n_tt.py --backend cuda train --preset base --amp --source ...
+pip install pjrt-plugin-tt --extra-index-url https://pypi.eng.aws.tenstorrent.com/
+pip install transformers datasets
 ```
 
-### Key Modifications from n.py
-1. `DeviceBackend` class abstracts CUDA/TT/CPU
-2. ALiBi biases are cached (avoids dynamic computation TT can't handle)
-3. Removed `@torch._dynamo.disable` decorators (TT needs to trace)
-4. KV-cache disabled on TT (falls back to full recomputation)
-5. `compile-test` command reports op compatibility
-6. `benchmark` command saves JSON results for comparison
-7. All mask functions take explicit `device` parameter
+### Presets
+`femto` -> `pico` -> `nano` -> `micro` -> `small` -> `base` -> `large` with expansion ratios from 1x to 96x.
 
-### What To Actually Test
-1. Does the model compile? → `compile-test`
-2. How fast is inference? → `benchmark` (compare to CUDA numbers)
-3. Which ops fall back? → Check compile-test output
-4. Is 24GB GDDR6 enough for 698M? → Yes, ~2.8GB fp16
-
-### Instance Is STATELESS
-Save everything externally before the 2-week window ends!
-```bash
-# Save benchmarks
-scp -r /workspace/benchmarks/ your_server:~/tt_benchmarks/
-```
+### License
+Apache-2.0
