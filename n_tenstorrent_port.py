@@ -241,7 +241,7 @@ def setup_runtime(args) -> BackendRuntime:
         import torch_xla.core.xla_model as xm
         import torch_xla.runtime as xr
 
-        xr.set_device_type("TT")
+        # xr.set_device_type("TT")  # DISABLED: TT plugin auto-configures
         compile_options = {
             "optimization_level": str(getattr(args, "tt_optimization_level", 1)),
         }
@@ -251,7 +251,7 @@ def setup_runtime(args) -> BackendRuntime:
             compile_options["experimental_enable_weight_bfp8_conversion"] = "true"
         if getattr(args, "tt_trace", False):
             compile_options["enable_trace"] = "true"
-        torch_xla.set_custom_compile_options(compile_options)
+        # torch_xla.set_custom_compile_options(compile_options)  # DISABLED: triggers ARC core crash
 
         xs = None
         mesh = None
