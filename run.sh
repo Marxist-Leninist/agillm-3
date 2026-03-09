@@ -117,7 +117,7 @@ for attempt in $(seq 1 $MAX_RETRIES); do
     --preset base \
     --warmstart_from "$CKPT" \
     --steps 1000000 \
-    --block 576 \
+    --block 384 \
     --batch_size 1 \
     --save_dir /workspace/ckpts_tt \
     --save_every_sec 1800 \

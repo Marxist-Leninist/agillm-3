@@ -1076,15 +1076,20 @@ def _tt_safe_cross_entropy(logits, targets, label_smoothing=0.0):
 
     Standard CE reshapes (B,N,V) to (B*N,V) which crashes on TT when
     V (VOCAB=128815) is not a multiple of 32.  This version uses only
-    element-wise ops and reductions — no reshape anywhere.
+    gather, element-wise ops and reductions — no reshape, no one_hot.
+
+    v2: replaced scatter_/one_hot/multiply with gather to cut DRAM usage.
+    one_hot allocated a full (B,N,V) zeros tensor (~148MB for block=576)
+    which pushed total DRAM past the N300 12-bank limit (9.48GB request,
+    only 9.5GB free with 780MB largest contiguous block per bank).
     """
     V = logits.size(-1)
     log_probs = F.log_softmax(logits, dim=-1)                    # (B, N, V)
-    one_hot = torch.zeros_like(log_probs)                         # (B, N, V)
-    one_hot.scatter_(-1, targets.unsqueeze(-1).long(), 1.0)       # mark targets
-    nll = -(one_hot * log_probs).sum(dim=-1)                      # (B, N)
+    # gather target log-probs: index is (B, N, 1), output is (B, N, 1)
+    idx = targets.unsqueeze(-1).long()                            # (B, N, 1)
+    nll = -torch.gather(log_probs, -1, idx).sum(dim=-1)          # (B, N)
     if label_smoothing > 0:
-        smooth_loss = -log_probs.sum(dim=-1) / V                  # (B, N)
+        smooth_loss = -log_probs.mean(dim=-1)                     # (B, N)
         nll = (1 - label_smoothing) * nll + label_smoothing * smooth_loss
     return nll.mean()
 
