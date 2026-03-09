@@ -117,10 +117,11 @@ for attempt in $(seq 1 $MAX_RETRIES); do
     --preset base \
     --warmstart_from "$CKPT" \
     --steps 1000000 \
-    --block 384 \
+    --block 128 \
     --batch_size 1 \
     --save_dir /workspace/ckpts_tt \
     --save_every_sec 1800 \
+    --ar_only \
     --tt_dtype bf16 \
     > /workspace/train_attempt${attempt}.log 2>&1 &
 
