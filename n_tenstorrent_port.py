@@ -1071,16 +1071,44 @@ def _loss_float(x: torch.Tensor) -> float:
 
 
 
+def _tt_safe_cross_entropy(logits, targets, label_smoothing=0.0):
+    """Cross-entropy without reshape — safe for TT 32x32 tile padding.
+
+    Standard CE reshapes (B,N,V) to (B*N,V) which crashes on TT when
+    V (VOCAB=128815) is not a multiple of 32.  This version uses only
+    element-wise ops and reductions — no reshape anywhere.
+    """
+    V = logits.size(-1)
+    log_probs = F.log_softmax(logits, dim=-1)                    # (B, N, V)
+    one_hot = torch.zeros_like(log_probs)                         # (B, N, V)
+    one_hot.scatter_(-1, targets.unsqueeze(-1).long(), 1.0)       # mark targets
+    nll = -(one_hot * log_probs).sum(dim=-1)                      # (B, N)
+    if label_smoothing > 0:
+        smooth_loss = -log_probs.sum(dim=-1) / V                  # (B, N)
+        nll = (1 - label_smoothing) * nll + label_smoothing * smooth_loss
+    return nll.mean()
+
+
 def _forward_train_losses(args, core, ar_h, sat_h, ids, ce_tok, ce_gate):
     h_ar = core(ids, causal_mask(ids.size(1)))
     logits_ar = ar_h(h_ar)[:, :-1]
-    loss_ar = ce_tok(logits_ar.float().reshape(-1, VOCAB), ids[:, 1:].reshape(-1))
+    if RUNTIME.is_tt:
+        # TT-safe: VOCAB=128815 is not tile-aligned (128815 % 32 != 0).
+        # reshape(-1, VOCAB) crashes because TT pads the last dim to 128832
+        # and the padded volume is not divisible by 128815.
+        ls = getattr(args, 'label_smoothing', 0.0)
+        loss_ar = _tt_safe_cross_entropy(logits_ar.float(), ids[:, 1:], ls)
+    else:
+        loss_ar = ce_tok(logits_ar.float().reshape(-1, VOCAB), ids[:, 1:].reshape(-1))
     if args.ar_only:
         return loss_ar
     h_sat = core(ids, sat_mask(ids.size(1)))
     logits_sat, gate = sat_h(h_sat[:, -SAT_BLOCK:])
     tgt_sat = ids[:, 1 : SAT_BLOCK + 1]
-    loss_sat = ce_tok(logits_sat.float().reshape(-1, VOCAB), tgt_sat.reshape(-1))
+    if RUNTIME.is_tt:
+        loss_sat = _tt_safe_cross_entropy(logits_sat.float(), tgt_sat, ls)
+    else:
+        loss_sat = ce_tok(logits_sat.float().reshape(-1, VOCAB), tgt_sat.reshape(-1))
     if gate is not None:
         loss_sat += EMIT_LAMBDA * ce_gate(gate.float(), torch.ones(ids.size(0), device=DEV, dtype=torch.long))
     return loss_ar + loss_sat
