@@ -1,6 +1,6 @@
 ﻿#!/usr/bin/env python3
 
-# n1.py â€” Joint AR+SAT Trainer with M-folded attention (exact, no tradeoff)
+# n2e.py â€” Joint AR+SAT Trainer with M-folded attention (exact, no tradeoff)
 #
 # THEOREM (Shared-U Score Capacity).
 # Let U in R^{dk x r} parameterize the attention metric M(U) := U U^T in R^{dk x dk}.
@@ -26,7 +26,7 @@
 # form). Checkpoints need one shared cfg rank, so the compact command stores all
 # layers at the max effective rank and zero-pads lower-rank layers. For r > dk
 # this is a strict parameter reduction with zero loss of attention behaviour.
-# Use:  python n1.py compact --src CKPT --dst OUT
+# Use:  python n2e.py compact --src CKPT --dst OUT
 #
 # CONSEQUENCE 3 (SAT-spec exactness, applied in `infer --mode spec`).
 # Let p be the AR distribution and q be the SAT draft distribution for the next
@@ -34,7 +34,7 @@
 # sample from r(x) proportional to max(p(x)-q(x), 0). Then the final token is
 # distributed exactly as p. Repeating this over a verified SAT draft block gives
 # AR-quality output while accepting multiple SAT tokens whenever q is close to p.
-# Use:  python n1.py prove --theorem spec_kernel
+# Use:  python n2e.py prove --theorem spec_kernel
 #
 # CONSEQUENCE 4 (exact SDPA backend, applied by default).
 # After M-folding, the remaining operation is still ordinary scaled dot-product
@@ -42,13 +42,13 @@
 # score->softmax->value pipeline can be replaced by
 # torch.nn.functional.scaled_dot_product_attention with identical outputs up to
 # floating-point ordering. Disable with --no_sdpa if a backend misbehaves.
-# Use:  python n1.py prove --theorem sdpa_equivalence
+# Use:  python n2e.py prove --theorem sdpa_equivalence
 #
 # TOKENIZER.
 # Default tokenizer is now deepseek-ai/DeepSeek-V4-Pro. If Transformers does
-# not know the new deepseek_v4 config yet, n1.py loads tokenizer.json directly.
+# not know the new deepseek_v4 config yet, n2e.py loads tokenizer.json directly.
 # OpenAI/tiktoken mode is available with:
-#     TOKENIZER_BACKEND=tiktoken TIKTOKEN_ENCODING=o200k_base python n1.py ...
+#     TOKENIZER_BACKEND=tiktoken TIKTOKEN_ENCODING=o200k_base python n2e.py ...
 #
 # Enhanced inference: checkpoint name, tok/s, UK time
 
@@ -2305,7 +2305,7 @@ theorem scalar_m_fold_nat (q k u : Nat) : (q * u) * (k * u) = q * (u * u) * k :=
     notes = [
         f"lean={lean}",
         f"proof_file={proof_path}",
-        "Lean proves the commutative scalar skeleton; n1.py's tensor checks catch shape/cache/gradient bugs.",
+        "Lean proves the commutative scalar skeleton; n2e.py's tensor checks catch shape/cache/gradient bugs.",
     ]
     if proc.stdout.strip():
         notes.append("stdout: " + proc.stdout.strip().splitlines()[0][:160])
@@ -2688,7 +2688,7 @@ def prove_spec_live(args) -> bool:
         """One mirror of the per-token accept/reject step from infer(--mode spec).
 
         Mirrors lines that begin at 'accept_prob = (p_tok / q_tok).clamp(max=1.0)'
-        in n1.py infer(). Returns the chosen token id.
+        in n2e.py infer(). Returns the chosen token id.
         """
         # Sample draft from q
         draft_tok = torch.multinomial(q, num_samples=1, generator=rng)
@@ -3230,7 +3230,7 @@ def main():
     cp.add_argument("--eps_ratio", type=float, default=1e-6,
                     help="Eigenvalue threshold relative to max eigenvalue")
     pr = sub.add_parser("prove",
-        help="Run n1.py-specific proof/checker tests for exact rewrites, caches, and SAT-spec sampling.")
+        help="Run n2e.py-specific proof/checker tests for exact rewrites, caches, and SAT-spec sampling.")
     pr.add_argument("--theorem",
                     choices=["all", "m_fold", "sdpa_equivalence", "cache_equivalence", "spec_kernel", "sat_alignment", "compact_u", "masks", "spec_live", "rewriter", "alibi", "lean_m_fold", "scaling_preview"],
                     default="all")
@@ -3242,7 +3242,7 @@ def main():
     pr.add_argument("--eps_ratio", type=float, default=1e-6)
     pr.add_argument("--proof_trials", type=int, default=64)
     pr.add_argument("--proof_vocab", type=int, default=97)
-    pr.add_argument("--lean_file", type=str, default=str(Path(__file__).with_name("n1_m_fold.lean")))
+    pr.add_argument("--lean_file", type=str, default=str(Path(__file__).with_name("n2e_m_fold.lean")))
     args = ap.parse_args()
     if args.cmd == "train": train(args)
     elif args.cmd == "infer": infer(args)
